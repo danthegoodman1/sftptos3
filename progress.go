@@ -48,6 +48,7 @@ func (p *progressReporter) Start() func() {
 	go func() {
 		defer wg.Done()
 
+		startBytes := p.counter.BytesRead()
 		ticker := time.NewTicker(p.interval)
 		defer ticker.Stop()
 
@@ -57,27 +58,34 @@ func (p *progressReporter) Start() func() {
 			case <-stop:
 				return
 			case now := <-ticker.C:
-				bytes := p.counter.BytesRead()
-				samples = append(samples, progressSample{when: now, bytes: bytes})
+				totalBytes := p.counter.BytesRead()
+				sessionBytes := totalBytes - startBytes
+				if sessionBytes < 0 {
+					sessionBytes = 0
+				}
+
+				samples = append(samples, progressSample{when: now, bytes: sessionBytes})
 				samples = pruneOldSamples(samples, now, p.window)
 
 				speed := rollingSpeed(samples)
 				percent := 100.0
 				if p.totalBytes > 0 {
-					percent = (float64(bytes) / float64(p.totalBytes)) * 100
+					percent = (float64(totalBytes) / float64(p.totalBytes)) * 100
 					if percent > 100 {
 						percent = 100
 					}
 				}
+				eta := estimateETA(totalBytes, p.totalBytes, speed)
 
-				log.Printf("progress remote=%s key=%s transferred=%d/%d pct=%.1f%% speed_last_%ds=%.2f MiB/s",
+				log.Printf("progress remote=%s key=%s transferred=%d/%d pct=%.1f%% speed_last_%ds=%.2f MiB/s eta=%s",
 					p.remotePath,
 					p.s3Key,
-					bytes,
+					totalBytes,
 					p.totalBytes,
 					percent,
 					int(p.window.Seconds()),
 					speed/(1024*1024),
+					eta,
 				)
 			}
 		}
@@ -118,4 +126,25 @@ func rollingSpeed(samples []progressSample) float64 {
 		return 0
 	}
 	return delta / elapsed
+}
+
+func estimateETA(transferred, total int64, speedBytesPerSec float64) string {
+	if total <= 0 {
+		return "unknown"
+	}
+	remaining := total - transferred
+	if remaining <= 0 {
+		return "0s"
+	}
+	if speedBytesPerSec <= 0 {
+		return "unknown"
+	}
+
+	etaSeconds := float64(remaining) / speedBytesPerSec
+	if etaSeconds <= 0 {
+		return "unknown"
+	}
+
+	eta := time.Duration(etaSeconds * float64(time.Second))
+	return eta.Round(time.Second).String()
 }

@@ -20,6 +20,8 @@ type Config struct {
 	SFTPUsername         string   `yaml:"sftp_username"`
 	SFTPKnownHostsFile   string   `yaml:"sftp_known_hosts_file"`
 	MultipartConcurrency int      `yaml:"multipart_concurrency"`
+	SFTPReadBufferBytes  int      `yaml:"sftp_read_buffer_bytes"`
+	ResumabilityDir      string   `yaml:"resumability_dir"`
 	S3Region             string   `yaml:"s3_region"`
 	S3Endpoint           string   `yaml:"s3_endpoint"`
 	S3UsePathStyle       bool     `yaml:"s3_use_path_style"`
@@ -71,6 +73,13 @@ func (c *Config) Normalize() {
 	if c.MultipartConcurrency == 0 {
 		c.MultipartConcurrency = 1
 	}
+	if c.SFTPReadBufferBytes == 0 {
+		c.SFTPReadBufferBytes = 32 * 1024 * 1024
+	}
+	c.ResumabilityDir = strings.TrimSpace(c.ResumabilityDir)
+	if c.ResumabilityDir == "" {
+		c.ResumabilityDir = "./resumability"
+	}
 	c.S3Region = strings.TrimSpace(c.S3Region)
 	c.S3Endpoint = strings.TrimSpace(c.S3Endpoint)
 	c.S3Bucket = strings.TrimSpace(c.S3Bucket)
@@ -108,6 +117,12 @@ func (c Config) Validate() error {
 	if c.MultipartConcurrency < 1 {
 		return fmt.Errorf("config field %q must be >= 1", "multipart_concurrency")
 	}
+	if c.SFTPReadBufferBytes < 1 {
+		return fmt.Errorf("config field %q must be >= 1", "sftp_read_buffer_bytes")
+	}
+	if c.ResumabilityDir == "" {
+		return fmt.Errorf("config field %q must not be empty", "resumability_dir")
+	}
 
 	return nil
 }
@@ -131,6 +146,8 @@ sftp_username: ""
 # Optional (defaults to ~/.ssh/known_hosts)
 sftp_known_hosts_file: "%s"
 multipart_concurrency: 1     # parallel multipart parts per file
+sftp_read_buffer_bytes: 33554432 # optional; 32 MiB
+resumability_dir: "./resumability" # optional; per-file multipart state
 
 s3_region: ""                # required; e.g. us-east-1
 s3_endpoint: ""              # optional; set for S3-compatible APIs

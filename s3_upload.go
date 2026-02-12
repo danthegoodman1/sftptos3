@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,10 +29,33 @@ import (
 	"sftptos3/internal/helpers"
 )
 
+const resumeStateVersion = 1
+
 type S3Uploader struct {
 	client *s3.Client
 	bucket string
 	cfg    Config
+}
+
+type resumeState struct {
+	Version    int       `json:"version"`
+	Bucket     string    `json:"bucket"`
+	RemotePath string    `json:"remote_path"`
+	S3Key      string    `json:"s3_key"`
+	FileSize   int64     `json:"file_size"`
+	PartSize   int64     `json:"part_size"`
+	UploadID   string    `json:"upload_id"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+func (s resumeState) Matches(file TransferFile, bucket string, partSize int64) bool {
+	return s.Version == resumeStateVersion &&
+		s.Bucket == bucket &&
+		s.RemotePath == file.RemotePath &&
+		s.S3Key == file.S3Key &&
+		s.FileSize == file.Size &&
+		s.PartSize == partSize &&
+		s.UploadID != ""
 }
 
 type multipartPartJob struct {
@@ -40,21 +69,17 @@ type multipartPartResult struct {
 	Err  error
 }
 
-type countingReadSeeker struct {
-	inner   io.ReadSeeker
+type countingReader struct {
+	inner   io.Reader
 	counter *atomicProgressCounter
 }
 
-func (r *countingReadSeeker) Read(p []byte) (int, error) {
+func (r *countingReader) Read(p []byte) (int, error) {
 	n, err := r.inner.Read(p)
 	if n > 0 {
 		r.counter.Add(int64(n))
 	}
 	return n, err
-}
-
-func (r *countingReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	return r.inner.Seek(offset, whence)
 }
 
 func NewS3Uploader(ctx context.Context, cfg Config) (*S3Uploader, error) {
@@ -65,6 +90,15 @@ func NewS3Uploader(ctx context.Context, cfg Config) (*S3Uploader, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
+	}
+
+	resumabilityDir, err := helpers.ExpandHome(cfg.ResumabilityDir)
+	if err != nil {
+		return nil, fmt.Errorf("expand resumability_dir: %w", err)
+	}
+	cfg.ResumabilityDir = resumabilityDir
+	if err := os.MkdirAll(cfg.ResumabilityDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create resumability_dir %q: %w", cfg.ResumabilityDir, err)
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
@@ -107,7 +141,15 @@ func (u *S3Uploader) ObjectExists(ctx context.Context, key string) (bool, error)
 }
 
 func (u *S3Uploader) UploadFile(ctx context.Context, file TransferFile, remoteFile *sftp.File) error {
+	resumePath, err := u.resumeStatePath(file)
+	if err != nil {
+		return fmt.Errorf("build resume state path: %w", err)
+	}
+
 	if file.Size == 0 {
+		if err := u.removeResumeState(resumePath); err != nil {
+			log.Printf("warning: failed to remove stale resume state for %s: %v", file.RemotePath, err)
+		}
 		return u.uploadEmptyFile(ctx, file)
 	}
 
@@ -116,20 +158,100 @@ func (u *S3Uploader) UploadFile(ctx context.Context, file TransferFile, remoteFi
 		return fmt.Errorf("compute part size: %w", err)
 	}
 
-	jobs := buildMultipartPartJobs(file.Size, partSize)
-	if len(jobs) == 0 {
+	allJobs := buildMultipartPartJobs(file.Size, partSize)
+	if len(allJobs) == 0 {
 		return fmt.Errorf("could not build multipart jobs for file size %d", file.Size)
 	}
 
 	workers := u.cfg.MultipartConcurrency
-	if workers > len(jobs) {
-		workers = len(jobs)
+	if workers > len(allJobs) {
+		workers = len(allJobs)
 	}
 	if workers < 1 {
 		workers = 1
 	}
 
+	uploadID := ""
+	existingParts := make(map[int32]s3types.CompletedPart)
+
+	state, err := u.loadResumeState(resumePath)
+	if err != nil {
+		return fmt.Errorf("load resume state: %w", err)
+	}
+
+	if state != nil {
+		if state.Matches(file, u.bucket, partSize) {
+			uploadID = state.UploadID
+			parts, listErr := u.listUploadedParts(ctx, file.S3Key, uploadID)
+			if listErr != nil {
+				if isNoSuchUploadError(listErr) {
+					log.Printf("resume upload missing on S3, starting new upload remote=%s key=%s", file.RemotePath, file.S3Key)
+					uploadID = ""
+					existingParts = make(map[int32]s3types.CompletedPart)
+					if err := u.removeResumeState(resumePath); err != nil {
+						log.Printf("warning: failed to remove stale resume state %s: %v", resumePath, err)
+					}
+				} else {
+					return fmt.Errorf("list uploaded parts for resume: %w", listErr)
+				}
+			} else {
+				existingParts = parts
+				log.Printf("resuming multipart upload remote=%s key=%s upload_id=%s existing_parts=%d",
+					file.RemotePath,
+					file.S3Key,
+					uploadID,
+					len(existingParts),
+				)
+			}
+		} else {
+			log.Printf("ignoring stale resume metadata for remote=%s key=%s", file.RemotePath, file.S3Key)
+			if err := u.removeResumeState(resumePath); err != nil {
+				log.Printf("warning: failed to remove stale resume state %s: %v", resumePath, err)
+			}
+		}
+	}
+
+	if uploadID == "" {
+		createOut, createErr := u.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(u.bucket),
+			Key:    aws.String(file.S3Key),
+		})
+		if createErr != nil {
+			return fmt.Errorf("create multipart upload: %w", createErr)
+		}
+		if createOut.UploadId == nil || *createOut.UploadId == "" {
+			return fmt.Errorf("create multipart upload returned empty upload id")
+		}
+		uploadID = *createOut.UploadId
+
+		newState := resumeState{
+			Version:    resumeStateVersion,
+			Bucket:     u.bucket,
+			RemotePath: file.RemotePath,
+			S3Key:      file.S3Key,
+			FileSize:   file.Size,
+			PartSize:   partSize,
+			UploadID:   uploadID,
+			CreatedAt:  time.Now().UTC(),
+		}
+		if saveErr := u.saveResumeState(resumePath, newState); saveErr != nil {
+			u.abortMultipartUpload(file.S3Key, uploadID)
+			return fmt.Errorf("persist resume state: %w", saveErr)
+		}
+	}
+
+	pendingJobs := make([]multipartPartJob, 0, len(allJobs))
+	resumedBytes := int64(0)
+	for _, job := range allJobs {
+		if _, ok := existingParts[job.PartNumber]; ok {
+			resumedBytes += job.Length
+			continue
+		}
+		pendingJobs = append(pendingJobs, job)
+	}
+
 	counter := &atomicProgressCounter{}
+	counter.Add(resumedBytes)
 	reporter := progressReporter{
 		remotePath: file.RemotePath,
 		s3Key:      file.S3Key,
@@ -142,55 +264,85 @@ func (u *S3Uploader) UploadFile(ctx context.Context, file TransferFile, remoteFi
 	stopProgress := reporter.Start()
 	defer stopProgress()
 
+	if resumedBytes > 0 {
+		resumedPct := (float64(resumedBytes) / float64(file.Size)) * 100
+		if resumedPct > 100 {
+			resumedPct = 100
+		}
+		log.Printf(
+			"resume baseline remote=%s key=%s transferred=%d/%d pct=%.1f%%",
+			file.RemotePath,
+			file.S3Key,
+			resumedBytes,
+			file.Size,
+			resumedPct,
+		)
+	}
+
 	log.Printf(
-		"starting multipart upload remote=%s key=%s size=%d part_size=%d MiB parts=%d concurrency=%d",
+		"starting multipart upload remote=%s key=%s size=%d part_size=%d MiB parts=%d pending_parts=%d resumed_bytes=%d concurrency=%d",
 		file.RemotePath,
 		file.S3Key,
 		file.Size,
 		partSize/(1024*1024),
-		len(jobs),
+		len(allJobs),
+		len(pendingJobs),
+		resumedBytes,
 		workers,
 	)
 
 	start := time.Now()
-	createOut, err := u.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(u.bucket),
-		Key:    aws.String(file.S3Key),
-	})
-	if err != nil {
-		return fmt.Errorf("create multipart upload: %w", err)
-	}
-	if createOut.UploadId == nil || *createOut.UploadId == "" {
-		return fmt.Errorf("create multipart upload returned empty upload id")
+	newParts := make([]s3types.CompletedPart, 0)
+	if len(pendingJobs) > 0 {
+		newParts, err = u.uploadParts(ctx, file, remoteFile, uploadID, pendingJobs, workers, counter)
+		if err != nil {
+			return err
+		}
 	}
 
-	parts, uploadErr := u.uploadParts(ctx, file, remoteFile, *createOut.UploadId, jobs, workers, counter)
-	if uploadErr != nil {
-		u.abortMultipartUpload(file.S3Key, *createOut.UploadId)
-		return uploadErr
+	partsByNumber := make(map[int32]s3types.CompletedPart, len(allJobs))
+	for partNumber, part := range existingParts {
+		partsByNumber[partNumber] = part
+	}
+	for _, part := range newParts {
+		partsByNumber[aws.ToInt32(part.PartNumber)] = part
+	}
+	if len(partsByNumber) != len(allJobs) {
+		return fmt.Errorf("multipart upload incomplete: uploaded parts=%d expected=%d", len(partsByNumber), len(allJobs))
 	}
 
-	sort.Slice(parts, func(i, j int) bool {
-		return aws.ToInt32(parts[i].PartNumber) < aws.ToInt32(parts[j].PartNumber)
+	finalParts := make([]s3types.CompletedPart, 0, len(partsByNumber))
+	for _, part := range partsByNumber {
+		finalParts = append(finalParts, part)
+	}
+	sort.Slice(finalParts, func(i, j int) bool {
+		return aws.ToInt32(finalParts[i].PartNumber) < aws.ToInt32(finalParts[j].PartNumber)
 	})
 
 	_, err = u.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(u.bucket),
 		Key:      aws.String(file.S3Key),
-		UploadId: createOut.UploadId,
+		UploadId: aws.String(uploadID),
 		MultipartUpload: &s3types.CompletedMultipartUpload{
-			Parts: parts,
+			Parts: finalParts,
 		},
 	})
 	if err != nil {
-		u.abortMultipartUpload(file.S3Key, *createOut.UploadId)
 		return fmt.Errorf("complete multipart upload: %w", err)
 	}
 
+	if err := u.removeResumeState(resumePath); err != nil {
+		log.Printf("warning: failed to remove resume state for remote=%s key=%s path=%s err=%v", file.RemotePath, file.S3Key, resumePath, err)
+	}
+
 	elapsed := time.Since(start)
+	sessionBytes := counter.BytesRead() - resumedBytes
+	if sessionBytes < 0 {
+		sessionBytes = counter.BytesRead()
+	}
 	avgSpeed := 0.0
 	if elapsed > 0 {
-		avgSpeed = (float64(counter.BytesRead()) / elapsed.Seconds()) / (1024 * 1024)
+		avgSpeed = (float64(sessionBytes) / elapsed.Seconds()) / (1024 * 1024)
 	}
 	log.Printf(
 		"uploaded remote=%s key=%s bytes=%d duration=%s avg=%.2f MiB/s part_size=%d MiB parts=%d concurrency=%d",
@@ -200,7 +352,7 @@ func (u *S3Uploader) UploadFile(ctx context.Context, file TransferFile, remoteFi
 		elapsed.Round(time.Millisecond),
 		avgSpeed,
 		partSize/(1024*1024),
-		len(parts),
+		len(finalParts),
 		workers,
 	)
 
@@ -308,7 +460,11 @@ func (u *S3Uploader) uploadPart(
 	counter *atomicProgressCounter,
 ) (s3types.CompletedPart, error) {
 	section := io.NewSectionReader(remoteFile, job.Offset, job.Length)
-	body := &countingReadSeeker{inner: section, counter: counter}
+	var baseReader io.Reader = section
+	if u.cfg.SFTPReadBufferBytes > 0 {
+		baseReader = bufio.NewReaderSize(section, u.cfg.SFTPReadBufferBytes)
+	}
+	body := &countingReader{inner: baseReader, counter: counter}
 
 	output, err := u.client.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:        aws.String(u.bucket),
@@ -342,6 +498,117 @@ func (u *S3Uploader) uploadEmptyFile(ctx context.Context, file TransferFile) err
 	}
 	log.Printf("uploaded remote=%s key=%s bytes=0 duration=0s avg=0.00 MiB/s", file.RemotePath, file.S3Key)
 	return nil
+}
+
+func (u *S3Uploader) listUploadedParts(ctx context.Context, key, uploadID string) (map[int32]s3types.CompletedPart, error) {
+	parts := make(map[int32]s3types.CompletedPart)
+	var marker string
+
+	for {
+		input := &s3.ListPartsInput{
+			Bucket:   aws.String(u.bucket),
+			Key:      aws.String(key),
+			UploadId: aws.String(uploadID),
+			MaxParts: aws.Int32(1000),
+		}
+		if marker != "" {
+			input.PartNumberMarker = aws.String(marker)
+		}
+
+		out, err := u.client.ListParts(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, part := range out.Parts {
+			if part.PartNumber == nil || part.ETag == nil || *part.ETag == "" {
+				continue
+			}
+			parts[aws.ToInt32(part.PartNumber)] = s3types.CompletedPart{
+				ETag:       part.ETag,
+				PartNumber: part.PartNumber,
+			}
+		}
+
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		if out.NextPartNumberMarker == nil || *out.NextPartNumberMarker == "" {
+			break
+		}
+		marker = *out.NextPartNumberMarker
+	}
+
+	return parts, nil
+}
+
+func (u *S3Uploader) resumeStatePath(file TransferFile) (string, error) {
+	dir := strings.TrimSpace(u.cfg.ResumabilityDir)
+	if dir == "" {
+		return "", fmt.Errorf("resumability_dir is empty")
+	}
+	hash := sha256.Sum256([]byte(u.bucket + "\n" + file.RemotePath + "\n" + file.S3Key))
+	filename := fmt.Sprintf("%x.json", hash[:16])
+	return filepath.Join(dir, filename), nil
+}
+
+func (u *S3Uploader) loadResumeState(filePath string) (*resumeState, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read resume state: %w", err)
+	}
+
+	var state resumeState
+	if err := json.Unmarshal(content, &state); err != nil {
+		return nil, fmt.Errorf("decode resume state: %w", err)
+	}
+	return &state, nil
+}
+
+func (u *S3Uploader) saveResumeState(filePath string, state resumeState) error {
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		return fmt.Errorf("create resume state directory: %w", err)
+	}
+
+	content, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode resume state: %w", err)
+	}
+
+	tempPath := filePath + ".tmp"
+	if err := os.WriteFile(tempPath, content, 0o600); err != nil {
+		return fmt.Errorf("write temp resume state: %w", err)
+	}
+
+	if err := os.Rename(tempPath, filePath); err != nil {
+		return fmt.Errorf("rename resume state file: %w", err)
+	}
+	return nil
+}
+
+func (u *S3Uploader) removeResumeState(filePath string) error {
+	err := os.Remove(filePath)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func isNoSuchUploadError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchUpload" {
+		return true
+	}
+
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == 404 {
+		return true
+	}
+
+	return false
 }
 
 func (u *S3Uploader) abortMultipartUpload(key, uploadID string) {

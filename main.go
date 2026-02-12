@@ -6,7 +6,19 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 )
+
+type TransferSummary struct {
+	TotalFiles    int
+	UploadedFiles int
+	SkippedFiles  int
+	FailedFiles   int
+	UploadedBytes int64
+	Duration      time.Duration
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -28,7 +40,9 @@ func run() error {
 		return nil
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	conn, err := ConnectSFTP(cfg)
 	if err != nil {
 		return fmt.Errorf("connect sftp: %w", err)
@@ -50,18 +64,31 @@ func run() error {
 		return fmt.Errorf("init s3 uploader: %w", err)
 	}
 
-	uploaded := 0
-	skipped := 0
+	startedAt := time.Now()
+	summary := TransferSummary{
+		TotalFiles: len(files),
+	}
+
 	for idx, file := range files {
+		select {
+		case <-ctx.Done():
+			summary.Duration = time.Since(startedAt)
+			logTransferSummary(summary)
+			return fmt.Errorf("transfer interrupted: %w", ctx.Err())
+		default:
+		}
+
 		log.Printf("[%d/%d] preparing remote=%s key=%s size=%d", idx+1, len(files), file.RemotePath, file.S3Key, file.Size)
 
 		if !cfg.Overwrite {
 			exists, headErr := uploader.ObjectExists(ctx, file.S3Key)
 			if headErr != nil {
-				return fmt.Errorf("check existing object %q: %w", file.S3Key, headErr)
+				summary.FailedFiles++
+				log.Printf("[%d/%d] failed remote=%s key=%s reason=head-check error=%v", idx+1, len(files), file.RemotePath, file.S3Key, headErr)
+				continue
 			}
 			if exists {
-				skipped++
+				summary.SkippedFiles++
 				log.Printf("[%d/%d] skipping existing key=%s", idx+1, len(files), file.S3Key)
 				continue
 			}
@@ -69,25 +96,44 @@ func run() error {
 
 		remoteFile, openErr := conn.Client.Open(file.RemotePath)
 		if openErr != nil {
-			return fmt.Errorf("open remote file %q: %w", file.RemotePath, openErr)
+			summary.FailedFiles++
+			log.Printf("[%d/%d] failed remote=%s key=%s reason=open-remote-file error=%v", idx+1, len(files), file.RemotePath, file.S3Key, openErr)
+			continue
 		}
 
 		uploadErr := uploader.UploadFile(ctx, file, remoteFile)
 		closeErr := remoteFile.Close()
 		if uploadErr != nil {
-			return fmt.Errorf("upload file %q: %w", file.RemotePath, uploadErr)
+			summary.FailedFiles++
+			log.Printf("[%d/%d] failed remote=%s key=%s reason=upload error=%v", idx+1, len(files), file.RemotePath, file.S3Key, uploadErr)
+			continue
 		}
 		if closeErr != nil {
-			return fmt.Errorf("close remote file %q: %w", file.RemotePath, closeErr)
+			log.Printf("[%d/%d] warning remote=%s close-remote-file error=%v", idx+1, len(files), file.RemotePath, closeErr)
 		}
 
-		uploaded++
+		summary.UploadedFiles++
+		summary.UploadedBytes += file.Size
 	}
 
-	if uploaded == 0 && skipped > 0 {
-		log.Printf("completed: uploaded=%d skipped=%d", uploaded, skipped)
-		return nil
+	summary.Duration = time.Since(startedAt)
+	logTransferSummary(summary)
+
+	if summary.FailedFiles > 0 {
+		return fmt.Errorf("transfer completed with %d failed file(s)", summary.FailedFiles)
 	}
-	log.Printf("completed: uploaded=%d skipped=%d", uploaded, skipped)
+
 	return nil
+}
+
+func logTransferSummary(summary TransferSummary) {
+	log.Printf(
+		"transfer summary total=%d uploaded=%d skipped=%d failed=%d uploaded_bytes=%d duration=%s",
+		summary.TotalFiles,
+		summary.UploadedFiles,
+		summary.SkippedFiles,
+		summary.FailedFiles,
+		summary.UploadedBytes,
+		summary.Duration.Round(time.Millisecond),
+	)
 }

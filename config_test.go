@@ -29,6 +29,12 @@ func TestLoadOrCreateConfigCreatesTemplate(t *testing.T) {
 	if !strings.Contains(string(content), "multipart_concurrency: 1") {
 		t.Fatalf("expected template to include multipart_concurrency option")
 	}
+	if !strings.Contains(string(content), "sftp_read_buffer_bytes: 33554432") {
+		t.Fatalf("expected template to include sftp_read_buffer_bytes option")
+	}
+	if !strings.Contains(string(content), "resumability_dir: \"./resumability\"") {
+		t.Fatalf("expected template to include resumability_dir option")
+	}
 	if !strings.Contains(string(content), "# Optional (defaults to ~/.ssh/known_hosts)") {
 		t.Fatalf("expected template to include known_hosts optional comment")
 	}
@@ -80,6 +86,22 @@ func TestConfigMultipartConcurrencyDefaultsOne(t *testing.T) {
 	}
 }
 
+func TestConfigSFTPReadBufferDefaults(t *testing.T) {
+	cfg := Config{}
+	cfg.Normalize()
+	if cfg.SFTPReadBufferBytes != 32*1024*1024 {
+		t.Fatalf("expected sftp_read_buffer_bytes default 33554432, got %d", cfg.SFTPReadBufferBytes)
+	}
+}
+
+func TestConfigResumabilityDirDefaults(t *testing.T) {
+	cfg := Config{}
+	cfg.Normalize()
+	if cfg.ResumabilityDir != "./resumability" {
+		t.Fatalf("expected resumability_dir default ./resumability, got %q", cfg.ResumabilityDir)
+	}
+}
+
 func TestConfigValidateMultipartConcurrencyMinimum(t *testing.T) {
 	cfg := Config{
 		SFTPPrivateKeyFile:   "/tmp/key",
@@ -94,5 +116,44 @@ func TestConfigValidateMultipartConcurrencyMinimum(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected validation failure for multipart_concurrency < 1")
+	}
+}
+
+func TestConfigValidateSFTPReadBufferMinimum(t *testing.T) {
+	cfg := Config{
+		SFTPPrivateKeyFile:   "/tmp/key",
+		SFTPServer:           "example.com:22",
+		SFTPUsername:         "user",
+		SFTPKnownHostsFile:   "/tmp/known_hosts",
+		MultipartConcurrency: 1,
+		SFTPReadBufferBytes:  0,
+		S3Region:             "us-east-1",
+		S3Bucket:             "bucket",
+		S3AccessKeyID:        "abc",
+		S3SecretAccessKey:    "def",
+	}
+	cfg.Normalize()
+	cfg.SFTPReadBufferBytes = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation failure for sftp_read_buffer_bytes < 1")
+	}
+}
+
+func TestConfigValidateResumabilityDirNotEmpty(t *testing.T) {
+	cfg := Config{
+		SFTPPrivateKeyFile:   "/tmp/key",
+		SFTPServer:           "example.com:22",
+		SFTPUsername:         "user",
+		SFTPKnownHostsFile:   "/tmp/known_hosts",
+		MultipartConcurrency: 1,
+		SFTPReadBufferBytes:  1,
+		ResumabilityDir:      "",
+		S3Region:             "us-east-1",
+		S3Bucket:             "bucket",
+		S3AccessKeyID:        "abc",
+		S3SecretAccessKey:    "def",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation failure for empty resumability_dir")
 	}
 }
