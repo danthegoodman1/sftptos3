@@ -24,6 +24,7 @@ type Config struct {
 	ResumabilityDir      string   `yaml:"resumability_dir"`
 	S3Region             string   `yaml:"s3_region"`
 	S3Endpoint           string   `yaml:"s3_endpoint"`
+	S3RetryMaxAttempts   int      `yaml:"s3_retry_max_attempts"`
 	S3UsePathStyle       bool     `yaml:"s3_use_path_style"`
 	S3Bucket             string   `yaml:"s3_bucket"`
 	S3AccessKeyID        string   `yaml:"s3_access_key_id"`
@@ -82,6 +83,9 @@ func (c *Config) Normalize() {
 	}
 	c.S3Region = strings.TrimSpace(c.S3Region)
 	c.S3Endpoint = strings.TrimSpace(c.S3Endpoint)
+	if c.S3RetryMaxAttempts == 0 {
+		c.S3RetryMaxAttempts = 20
+	}
 	c.S3Bucket = strings.TrimSpace(c.S3Bucket)
 	c.S3AccessKeyID = strings.TrimSpace(c.S3AccessKeyID)
 	c.S3SecretAccessKey = strings.TrimSpace(c.S3SecretAccessKey)
@@ -123,6 +127,9 @@ func (c Config) Validate() error {
 	if c.ResumabilityDir == "" {
 		return fmt.Errorf("config field %q must not be empty", "resumability_dir")
 	}
+	if c.S3RetryMaxAttempts < 1 {
+		return fmt.Errorf("config field %q must be >= 1", "s3_retry_max_attempts")
+	}
 
 	return nil
 }
@@ -151,6 +158,7 @@ resumability_dir: "./resumability" # optional; per-file multipart state
 
 s3_region: ""                # required; e.g. us-east-1
 s3_endpoint: ""              # optional; set for S3-compatible APIs
+s3_retry_max_attempts: 20    # optional; per-request attempts (includes first try)
 s3_use_path_style: false     # optional; enable path-style addressing
 s3_bucket: ""
 s3_access_key_id: ""

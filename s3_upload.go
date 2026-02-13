@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -87,6 +88,11 @@ func NewS3Uploader(ctx context.Context, cfg Config) (*S3Uploader, error) {
 		ctx,
 		config.WithRegion(cfg.S3Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.S3AccessKeyID, cfg.S3SecretAccessKey, "")),
+		config.WithRetryer(func() aws.Retryer {
+			return retry.NewStandard(func(o *retry.StandardOptions) {
+				o.MaxAttempts = cfg.S3RetryMaxAttempts
+			})
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)

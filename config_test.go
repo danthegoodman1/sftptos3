@@ -44,6 +44,9 @@ func TestLoadOrCreateConfigCreatesTemplate(t *testing.T) {
 	if !strings.Contains(string(content), "s3_use_path_style: false") {
 		t.Fatalf("expected template to include s3_use_path_style option")
 	}
+	if !strings.Contains(string(content), "s3_retry_max_attempts: 20") {
+		t.Fatalf("expected template to include s3_retry_max_attempts option")
+	}
 }
 
 func TestConfigNormalizeDefaultsKnownHosts(t *testing.T) {
@@ -102,6 +105,14 @@ func TestConfigResumabilityDirDefaults(t *testing.T) {
 	}
 }
 
+func TestConfigS3RetryMaxAttemptsDefaults(t *testing.T) {
+	cfg := Config{}
+	cfg.Normalize()
+	if cfg.S3RetryMaxAttempts != 20 {
+		t.Fatalf("expected s3_retry_max_attempts default 20, got %d", cfg.S3RetryMaxAttempts)
+	}
+}
+
 func TestConfigValidateMultipartConcurrencyMinimum(t *testing.T) {
 	cfg := Config{
 		SFTPPrivateKeyFile:   "/tmp/key",
@@ -155,5 +166,25 @@ func TestConfigValidateResumabilityDirNotEmpty(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected validation failure for empty resumability_dir")
+	}
+}
+
+func TestConfigValidateS3RetryMaxAttemptsMinimum(t *testing.T) {
+	cfg := Config{
+		SFTPPrivateKeyFile:   "/tmp/key",
+		SFTPServer:           "example.com:22",
+		SFTPUsername:         "user",
+		SFTPKnownHostsFile:   "/tmp/known_hosts",
+		MultipartConcurrency: 1,
+		SFTPReadBufferBytes:  1,
+		ResumabilityDir:      "./resumability",
+		S3RetryMaxAttempts:   -1,
+		S3Region:             "us-east-1",
+		S3Bucket:             "bucket",
+		S3AccessKeyID:        "abc",
+		S3SecretAccessKey:    "def",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation failure for s3_retry_max_attempts < 1")
 	}
 }
