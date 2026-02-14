@@ -70,19 +70,6 @@ type multipartPartResult struct {
 	Err  error
 }
 
-type countingReader struct {
-	inner   io.Reader
-	counter *atomicProgressCounter
-}
-
-func (r *countingReader) Read(p []byte) (int, error) {
-	n, err := r.inner.Read(p)
-	if n > 0 {
-		r.counter.Add(int64(n))
-	}
-	return n, err
-}
-
 func NewS3Uploader(ctx context.Context, cfg Config) (*S3Uploader, error) {
 	awsCfg, err := config.LoadDefaultConfig(
 		ctx,
@@ -470,14 +457,13 @@ func (u *S3Uploader) uploadPart(
 	if u.cfg.SFTPReadBufferBytes > 0 {
 		baseReader = bufio.NewReaderSize(section, u.cfg.SFTPReadBufferBytes)
 	}
-	body := &countingReader{inner: baseReader, counter: counter}
 
 	output, err := u.client.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:        aws.String(u.bucket),
 		Key:           aws.String(file.S3Key),
 		UploadId:      aws.String(uploadID),
 		PartNumber:    aws.Int32(job.PartNumber),
-		Body:          body,
+		Body:          baseReader,
 		ContentLength: aws.Int64(job.Length),
 	})
 	if err != nil {
@@ -486,6 +472,7 @@ func (u *S3Uploader) uploadPart(
 	if output.ETag == nil || *output.ETag == "" {
 		return s3types.CompletedPart{}, fmt.Errorf("empty ETag from upload part %d", job.PartNumber)
 	}
+	counter.Add(job.Length)
 
 	return s3types.CompletedPart{
 		ETag:       output.ETag,
@@ -539,13 +526,32 @@ func (u *S3Uploader) listUploadedParts(ctx context.Context, key, uploadID string
 		if !aws.ToBool(out.IsTruncated) {
 			break
 		}
-		if out.NextPartNumberMarker == nil || *out.NextPartNumberMarker == "" {
-			break
+		nextMarker, err := nextPartNumberMarker(marker, out.Parts, out.NextPartNumberMarker)
+		if err != nil {
+			return nil, fmt.Errorf("list parts pagination stalled for key=%s upload_id=%s marker=%q: %w", key, uploadID, marker, err)
 		}
-		marker = *out.NextPartNumberMarker
+		marker = nextMarker
 	}
 
 	return parts, nil
+}
+
+func nextPartNumberMarker(current string, parts []s3types.Part, next *string) (string, error) {
+	nextMarker := strings.TrimSpace(aws.ToString(next))
+	if nextMarker == "" {
+		if len(parts) == 0 {
+			return "", fmt.Errorf("response is truncated but page has no parts and no next marker")
+		}
+		lastPart := parts[len(parts)-1]
+		if lastPart.PartNumber == nil {
+			return "", fmt.Errorf("response is truncated but last part has no part number")
+		}
+		nextMarker = fmt.Sprintf("%d", aws.ToInt32(lastPart.PartNumber))
+	}
+	if nextMarker == current {
+		return "", fmt.Errorf("next marker %q did not advance", nextMarker)
+	}
+	return nextMarker, nil
 }
 
 func (u *S3Uploader) resumeStatePath(file TransferFile) (string, error) {
