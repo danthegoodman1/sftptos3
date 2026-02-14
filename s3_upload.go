@@ -251,7 +251,7 @@ func (u *S3Uploader) UploadFile(ctx context.Context, file TransferFile, remoteFi
 		totalBytes: file.Size,
 		counter:    counter,
 		interval:   2 * time.Second,
-		window:     10 * time.Second,
+		window:     60 * time.Second,
 	}
 
 	stopProgress := reporter.Start()
